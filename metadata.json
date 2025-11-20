@@ -1,0 +1,5 @@
+{
+  "name": "HyperDeck Web Controller",
+  "description": "A professional web-based controller for Blackmagic HyperDeck recorders, featuring transport controls, clip management, and timecode display. Simulates the functionality of the original Python/Tkinter application.",
+  "requestFramePermissions": []
+}

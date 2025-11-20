@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HyperDeck Web Controller</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Babel for compiling JSX in the browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Custom Styles -->
+    <style>
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: #18181b; }
+      ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+      @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;500;600;700&display=swap');
+      
+      /* Animation for recording tally */
+      @keyframes pulse-rec {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+      }
+      .animate-pulse-rec {
+        animation: pulse-rec 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      }
+    </style>
+
+    <!-- Tailwind Config -->
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Inter', 'sans-serif'],
+              mono: ['JetBrains Mono', 'monospace'],
+            },
+            colors: {
+              hyper: {
+                bg: '#121212',
+                panel: '#1E1E1E',
+                accent: '#007AFF',
+                rec: '#FF3B30',
+                play: '#34C759',
+              }
+            }
+          }
+        }
+      }
+    </script>
+
+    <!-- Import Map -->
+    <script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client?deps=react@18.2.0",
+    "lucide-react": "https://esm.sh/lucide-react@0.263.1?deps=react@18.2.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/"
+  }
+}
+</script>
+  </head>
+  <body class="bg-hyper-bg text-white h-screen overflow-hidden">
+    <div id="root"></div>
+
+    <!-- MAIN APPLICATION SCRIPT -->
+    <script type="text/babel" data-type="module">
+      import React, { useState, useEffect, useCallback, useRef } from 'react';
+      import { createRoot } from 'react-dom/client';
+      import { 
+        Wifi, WifiOff, Play, Square, Circle, Rewind, FastForward, 
+        SkipBack, SkipForward, Eye, Repeat, Folder, Settings, 
+        Terminal, PlayCircle, HardDrive, Trash2, Edit, RefreshCw, Filter, Infinity as LoopIcon
+      } from 'lucide-react';
+
+      // --- TYPES ---
+      const TransportStatus = {
+        STOPPED: 'stopped',
+        PLAYING: 'play',
+        RECORDING: 'record',
+        SHUTTLE: 'shuttle',
+        PREVIEW: 'preview'
+      };
+
+      // Updated based on HyperDeck Manual Page 6 & 21
+      const FORMAT_OPTIONS = [
+        "QuickTimeProResHQ", "QuickTimeProRes", "QuickTimeProResLT", 
+        "QuickTimeProResProxy", "DNxHD220x", "QuickTimeDNxHD220x", 
+        "DNxHR_HQX", "QuickTimeDNxHR_HQX",
+        "H.264High", "H.264Medium", "H.264Low", 
+        "H.265High", "H.265Medium", "H.265Low"
+      ];
+
+      const INPUT_OPTIONS = ["SDI", "HDMI", "Component"];
+
+      // --- UTILS: TIMECODE ---
+      const timecodeToFrames = (tc, fps = 25) => {
+        if (!tc || tc === "--:--:--:--") return 0;
+        const parts = tc.replace(';', ':').split(':');
+        if (parts.length !== 4) return 0;
+        const h = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10);
+        const s = parseInt(parts[2], 10);
+        const f = parseInt(parts[3], 10);
+        return (h * 3600 + m * 60 + s) * fps + f;
+      };
+
+      const framesToTimecode = (frames, fps = 25) => {
+        if (frames < 0) frames = 0;
+        const f = Math.floor(frames % fps);
+        const totalSeconds = Math.floor(frames / fps);
+        const s = totalSeconds % 60;
+        const totalMinutes = Math.floor(totalSeconds / 60);
+        const m = totalMinutes % 60;
+        const h = Math.floor(totalMinutes / 60);
+        const pad = (n) => n.toString().padStart(2, '0');
+        return `${pad(h)}:${pad(m)}:${pad(s)}:${pad(f)}`;
+      };
+
+      const calculateRemaining = (currentTc, startTc, durationTc) => {
+        if (!startTc || !durationTc) return "--:--:--:--";
+        const current = timecodeToFrames(currentTc);
+        const start = timecodeToFrames(startTc);
+        const duration = timecodeToFrames(durationTc);
+        
+        const endFrame = start + duration;
+        const remainingFrames = endFrame - current;
+        
+        if (remainingFrames < 0) return "00:00:00:00";
+        
+        return framesToTimecode(remainingFrames);
+      };
+
+      // --- HOOK: USE HYPERDECK ---
+      const MOCK_CLIPS = [
+        { id: "1", name: "DEMO_Reel_001.mov", duration: "00:10:00:00", startTc: "01:00:00:00" },
+        { id: "2", name: "DEMO_Reel_002.mov", duration: "00:05:30:12", startTc: "01:10:00:00" },
+      ];
+
+      const useHyperDeck = () => {
+        const [state, setState] = useState({
+          isConnected: false,
+          isConnecting: false,
+          simulationMode: false,
+          ipAddress: "192.168.0.27",
+          status: TransportStatus.STOPPED,
+          timecode: "00:00:00:00",
+          remaining: "--:--:--:--",
+          activeSlot: 1,
+          currentClipId: null,
+          videoInput: "SDI",
+          fileFormat: "QuickTimeProResHQ",
+          loop: false,
+          singleClip: true, 
+          speed: 0,
+          clips: [], 
+          log: ["System ready."]
+        });
+
+        const socketRef = useRef(null);   
+        const pollRef = useRef(null);
+        const playbackTickerRef = useRef(null);
+        const lastPollTime = useRef(0);
+        
+        const addLog = (msg) => {
+          // Removed '500' from ignored list so syntax errors are visible
+          const IGNORED_PREFIXES = ['208 transport info', '202 slot info', '212 slot info', '209', '205'];
+          const isPollingMessage = IGNORED_PREFIXES.some(prefix => msg.includes(prefix));
+          if (isPollingMessage) return;
+          
+          setState(prev => ({ ...prev, log: [...prev.log.slice(-99), `[${new Date().toLocaleTimeString()}] ${msg}`] }));
+        };
+
+        const parseHyperDeckData = (text) => {
+            const updates = {};
+            let newClips = [];
+            
+            // CRITICAL FIX: Handle empty timeline/disk errors to clear clip list
+            if (text.includes('107 timeline empty') || text.includes('105 no disk')) {
+                setState(prev => ({
+                    ...prev,
+                    clips: [],
+                    currentClipId: null,
+                    timecode: "00:00:00:00",
+                    remaining: "--:--:--:--",
+                    status: TransportStatus.STOPPED
+                }));
+                return; // Exit early
+            }
+
+            const statusMatch = text.match(/status:\s*([a-z]+)/i);
+            const timecodeMatch = text.match(/timecode:\s*(\d{2}:\d{2}:\d{2}:\d{2})/i);
+            const clipIdMatch = text.match(/clip id:\s*(\d+)/i);
+            const slotMatch = text.match(/slot id:\s*(\d+)/i);
+            const loopMatch = text.match(/loop:\s*(true|false)/i);
+            const singleMatch = text.match(/single clip:\s*(true|false)/i);
+            const speedMatch = text.match(/speed:\s*(-?\d+)/i);
+            // Updated regex for file format (Manual Page 22)
+            const formatMatch = text.match(/file format:\s*([a-zA-Z0-9_]+)/i);
+            const inputMatch = text.match(/video input:\s*([a-zA-Z]+)/i);
+
+            if (statusMatch) {
+                let s = statusMatch[1].toLowerCase();
+                if (s === 'playing') s = TransportStatus.PLAYING;
+                if (s === 'recording') s = TransportStatus.RECORDING;
+                if (s === 'preview') s = TransportStatus.PREVIEW;
+                if (s === 'stopped') s = TransportStatus.STOPPED;
+                updates.status = s;
+            }
+            
+            if (clipIdMatch) {
+                updates.currentClipId = clipIdMatch[1];
+            }
+
+            if (timecodeMatch) {
+                updates.timecode = timecodeMatch[1];
+                
+                const activeCid = updates.currentClipId || state.currentClipId;
+                
+                // Try to find clip in new list if populated, otherwise existing list
+                const clipList = newClips.length > 0 ? newClips : state.clips;
+                const clip = clipList.find(c => c.id == activeCid);
+                
+                if (clip) {
+                    updates.remaining = calculateRemaining(updates.timecode, clip.startTc, clip.duration);
+                }
+            }
+
+            if (slotMatch) updates.activeSlot = parseInt(slotMatch[1]);
+            if (loopMatch) updates.loop = (loopMatch[1] === 'true');
+            if (singleMatch) updates.singleClip = (singleMatch[1] === 'true');
+            if (speedMatch) updates.speed = parseInt(speedMatch[1]);
+            if (formatMatch) updates.fileFormat = formatMatch[1];
+            if (inputMatch) updates.videoInput = inputMatch[1];
+
+            // Improved Clip List Parsing using Global Regex
+            // Finds pattern "ID: Name StartTC Duration" anywhere in the text
+            if (!text.includes('clips count')) {
+                const clipRegex = /(\d+):\s+(.+?)\s+(\d{2}:\d{2}:\d{2}:\d{2})\s+(\d{2}:\d{2}:\d{2}:\d{2})/g;
+                let match;
+                let foundAny = false;
+                while ((match = clipRegex.exec(text)) !== null) {
+                    foundAny = true;
+                    newClips.push({
+                        id: match[1],
+                        name: match[2].trim(),
+                        startTc: match[3],
+                        duration: match[4]
+                    });
+                }
+                
+                if (foundAny) {
+                   setState(prev => ({ ...prev, clips: newClips }));
+                   // Immediate recalc if we found the current clip in this new list
+                   const activeCid = updates.currentClipId || state.currentClipId;
+                   const currentClip = newClips.find(c => c.id == activeCid);
+                   if (currentClip && updates.timecode) {
+                       updates.remaining = calculateRemaining(updates.timecode, currentClip.startTc, currentClip.duration);
+                   }
+                }
+            }
+            
+            if (Object.keys(updates).length > 0) setState(prev => ({ ...prev, ...updates }));
+        };
+
+        // --- COUNTDOWN TICKER ---
+        useEffect(() => {
+            if (state.status !== 'play' && state.status !== 'record' && state.status !== 'shuttle') {
+                if (playbackTickerRef.current) clearInterval(playbackTickerRef.current);
+                playbackTickerRef.current = null;
+                return;
+            }
+
+            if (playbackTickerRef.current) return; 
+
+            playbackTickerRef.current = setInterval(() => {
+                setState(prev => {
+                    if (Date.now() - lastPollTime.current < 100) return prev;
+
+                    const fps = 25; 
+                    // Handle Shuttle Speed for prediction
+                    let speedMult = 1;
+                    if (prev.status === 'shuttle' && prev.speed) {
+                        speedMult = prev.speed / 100;
+                    }
+                    
+                    const currentFrames = timecodeToFrames(prev.timecode, fps);
+                    const nextFrames = currentFrames + (1 * speedMult); 
+                    const nextTc = framesToTimecode(nextFrames, fps);
+                    
+                    let nextRemaining = prev.remaining;
+                    const currentClip = prev.clips.find(c => c.id == prev.currentClipId);
+                    
+                    if (currentClip) {
+                         nextRemaining = calculateRemaining(nextTc, currentClip.startTc, currentClip.duration);
+                    }
+
+                    return {
+                        ...prev,
+                        timecode: nextTc,
+                        remaining: nextRemaining
+                    };
+                });
+            }, 40); 
+
+            return () => { if(playbackTickerRef.current) clearInterval(playbackTickerRef.current); playbackTickerRef.current = null; };
+        }, [state.status]); 
+
+        const connect = (ip) => {
+          setState(prev => ({ ...prev, ipAddress: ip, isConnecting: true }));
+          addLog(`Connecting to ${ip}...`);
+
+          if (state.simulationMode) {
+              setTimeout(() => {
+                setState(prev => ({ ...prev, isConnected: true, isConnecting: false, clips: MOCK_CLIPS, status: 'stopped' }));
+                addLog(`[SIM] Connected to ${ip}`);
+              }, 800);
+          } else {
+              try {
+                  if (socketRef.current) socketRef.current.close();
+                  const ws = new WebSocket('ws://localhost:8081');
+                  socketRef.current = ws;
+
+                  ws.onopen = () => {
+                      addLog("Connected to Local Proxy (8081). Bridging...");
+                      ws.send(`connect ${ip}`);
+                      
+                      setTimeout(() => ws.send('transport info'), 100);
+                      setTimeout(() => ws.send('slot info'), 200);
+                      setTimeout(() => ws.send('clips get'), 500);
+                      setTimeout(() => ws.send('configuration info'), 1500);
+                  };
+
+                  ws.onmessage = (event) => {
+                      // LOGGING ENABLED FOR INCOMING MESSAGES
+                      addLog(event.data);
+                      
+                      lastPollTime.current = Date.now();
+                      parseHyperDeckData(event.data);
+                      
+                      if (event.data.includes('SYSTEM: Connected') || event.data.includes('200 ok')) {
+                          if (!state.isConnected) {
+                             setState(prev => ({...prev, isConnected: true, isConnecting: false}));
+                          }
+                      }
+                  };
+
+                  ws.onclose = () => {
+                      addLog("Proxy connection closed.");
+                      disconnect();
+                  };
+
+                  ws.onerror = (err) => {
+                      disconnect();
+                      addLog("Error connecting to Proxy 8081.");
+                  };
+
+                  if (pollRef.current) clearInterval(pollRef.current);
+                  pollRef.current = setInterval(() => {
+                      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                          socketRef.current.send("transport info");
+                      }
+                  }, 200); 
+
+              } catch (e) {
+                  addLog(`Error: ${e.message}`);
+                  setState(prev => ({ ...prev, isConnecting: false }));
+              }
+          }
+        };
+
+        const disconnect = () => {
+          if (socketRef.current) { socketRef.current.close(); socketRef.current = null; }
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+          if (playbackTickerRef.current) { clearInterval(playbackTickerRef.current); }
+          setState(prev => ({ ...prev, isConnected: false, isConnecting: false, status: TransportStatus.STOPPED }));
+          addLog("Disconnected.");
+        };
+
+        const sendCmd = (cmd) => {
+            if (state.simulationMode) return; 
+            if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                socketRef.current.send(cmd);
+                addLog(`> ${cmd}`);
+            }
+        };
+
+        const toggleSimulation = () => {
+             disconnect();
+             setState(prev => ({ ...prev, simulationMode: !prev.simulationMode }));
+        };
+
+        const play = (loopMode = false) => {
+          if (!state.isConnected) return;
+          let cmd = 'play:'; 
+          if (loopMode) cmd += ' loop: true single clip: true';
+          else cmd += ' single clip: true';
+
+          if (state.simulationMode) {
+             setState(prev => ({ ...prev, status: TransportStatus.PLAYING, loop: loopMode, singleClip: true }));
+          } else {
+             sendCmd(cmd);
+             setState(prev => ({ ...prev, status: TransportStatus.PLAYING, loop: loopMode, singleClip: true }));
+          }
+        };
+
+        const stop = () => {
+          if (!state.isConnected) return;
+          if (state.simulationMode) setState(prev => ({ ...prev, status: TransportStatus.STOPPED }));
+          else {
+              sendCmd("stop");
+              setState(prev => ({ ...prev, status: TransportStatus.STOPPED }));
+          }
+        };
+
+        const record = () => {
+          if (!state.isConnected) return;
+          sendCmd("record");
+          setState(prev => ({ ...prev, status: TransportStatus.RECORDING }));
+        };
+
+        const shuttle = (speed) => {
+           if (!state.isConnected) return;
+           sendCmd(`shuttle: speed: ${speed}`);
+           setState(prev => ({ ...prev, status: TransportStatus.SHUTTLE, speed }));
+        };
+
+        const preview = () => {
+            if (!state.isConnected) return;
+            sendCmd("preview: enable: true");
+            setState(prev => ({ ...prev, status: TransportStatus.PREVIEW }));
+        };
+
+        const gotoClip = (clipId) => {
+          if (!state.isConnected) return;
+          sendCmd(`goto: clip id: ${clipId}`);
+          const clip = state.clips.find(c => c.id == clipId);
+          if (clip) {
+             setState(prev => ({ 
+                 ...prev, 
+                 currentClipId: clipId, 
+                 timecode: clip.startTc, 
+                 remaining: clip.duration 
+             }));
+          }
+        };
+
+        const nextClip = () => {
+            if (!state.isConnected) return;
+            const currentIndex = state.clips.findIndex(c => c.id == state.currentClipId);
+            if (currentIndex !== -1 && currentIndex < state.clips.length - 1) {
+                const nextId = state.clips[currentIndex + 1].id;
+                gotoClip(nextId);
+            }
+        };
+
+        const prevClip = () => {
+            if (!state.isConnected) return;
+            const currentIndex = state.clips.findIndex(c => c.id == state.currentClipId);
+            if (currentIndex > 0) {
+                const prevId = state.clips[currentIndex - 1].id;
+                gotoClip(prevId);
+            }
+        };
+
+        const selectSlot = (slotId) => {
+            if (!state.isConnected) return;
+            sendCmd(`slot select: slot id: ${slotId}`);
+            setTimeout(() => sendCmd('clips get'), 500);
+        };
+
+        const refreshClips = () => {
+            if(!state.isConnected) return;
+            addLog("Refreshing clip list...");
+            sendCmd('clips get');
+        };
+
+        const deleteFile = (filename) => {
+            sendCmd(`delete: name: ${filename}`); 
+        };
+
+        const renameFile = (oldName, newName) => {
+           sendCmd(`rename: name: ${oldName} newname: ${newName}`);
+        };
+
+        const setConfig = (key, val) => {
+            if (!state.isConnected) return;
+            if (key === 'raw') sendCmd(val);
+            else sendCmd(`configuration: ${key}: ${val}`);
+        };
+
+        return {
+          state,
+          actions: { connect, disconnect, toggleSimulation, play, stop, record, shuttle, preview, gotoClip, nextClip, prevClip, selectSlot, deleteFile, renameFile, setConfig, refreshClips }
+        };
+      };
+
+      // --- COMPONENT: Transport ---
+      const Transport = ({ status, loop, isConnected, onPlay, onStop, onRecord, onShuttle, onPreview, onSkipNext, onSkipPrev }) => {
+        const btnBase = "relative group flex flex-col items-center justify-center rounded-lg p-2 sm:p-4 transition-all active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed shadow-lg border-t border-white/5";
+        
+        const isPlaying = status === 'play' || status === 'playing';
+        const isStopped = status === 'stopped' || status === 'standby';
+        const isRecording = status === 'record' || status === 'recording';
+        const isShuttle = status === 'shuttle';
+        const isPreview = status === 'preview';
+        
+        return (
+          <div className="grid grid-cols-3 sm:grid-cols-9 gap-2 w-full">
+              <button disabled={!isConnected} onClick={onSkipPrev} className={`${btnBase} bg-zinc-800 text-zinc-300 hover:bg-zinc-700`}><SkipBack size={20} /><span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Prev</span></button>
+              <button disabled={!isConnected} onClick={() => onShuttle(-1600)} className={`${btnBase} bg-zinc-800 text-zinc-300 hover:bg-zinc-700 ${isShuttle ? 'border-amber-500 text-amber-500' : ''}`}><Rewind size={20} /><span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Rew</span></button>
+              
+              {/* PREVIEW BUTTON */}
+              <button disabled={!isConnected} onClick={onPreview} className={`${btnBase} bg-zinc-800 text-zinc-300 hover:bg-zinc-700 ${isPreview ? 'bg-amber-900/40 border-amber-500 text-amber-500' : ''}`}>
+                  <Eye size={20} />
+                  <span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Preview</span>
+              </button>
+
+              <button disabled={!isConnected} onClick={onStop} className={`${btnBase} ${isStopped ? 'bg-blue-600 text-white shadow-blue-500/40' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}>
+                 <Square size={20} fill="currentColor" />
+                 <span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Stop</span>
+              </button>
+              
+              <button disabled={!isConnected} onClick={() => onPlay(false)} className={`${btnBase} ${isPlaying && !loop ? 'bg-hyper-play text-black shadow-green-500/40' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}>
+                 <Play size={20} fill="currentColor" />
+                 <span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Play</span>
+              </button>
+
+              <button disabled={!isConnected} onClick={() => onPlay(true)} className={`${btnBase} ${isPlaying && loop ? 'bg-green-400 text-black shadow-green-400/40' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}>
+                 <LoopIcon size={20} />
+                 <span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Loop</span>
+              </button>
+              
+              <button disabled={!isConnected} onClick={() => onShuttle(1600)} className={`${btnBase} bg-zinc-800 text-zinc-300 hover:bg-zinc-700 ${isShuttle ? 'border-amber-500 text-amber-500' : ''}`}><FastForward size={20} /><span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Fwd</span></button>
+              <button disabled={!isConnected} onClick={onSkipNext} className={`${btnBase} bg-zinc-800 text-zinc-300 hover:bg-zinc-700`}><SkipForward size={20} /><span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Next</span></button>
+
+              <button disabled={!isConnected} onClick={onRecord} className={`${btnBase} bg-zinc-800 text-red-500 hover:bg-zinc-700 ${isRecording ? 'bg-red-600 text-white animate-pulse-rec' : ''}`}><Circle size={20} fill="currentColor" /><span className="text-[9px] sm:text-[10px] mt-1 font-bold uppercase">Rec</span></button>
+          </div>
+        );
+      };
+
+      // --- COMPONENT: Display ---
+      const Display = ({ timecode, remaining, clipName, status, activeSlot, loop, isConnected, fileFormat, videoInput }) => {
+        let displayStatus = "OFFLINE";
+        if (isConnected) {
+            displayStatus = status.toUpperCase();
+            if (status === 'play' || status === 'playing') {
+                displayStatus = loop ? "PLAYING LOOP (SINGLE)" : "PLAYING (SINGLE)";
+            }
+        }
+
+        return (
+          <div className="bg-black border border-zinc-700 rounded-lg p-6 mb-6 shadow-2xl relative overflow-hidden shrink-0">
+              <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-zinc-900 to-black opacity-80 pointer-events-none"></div>
+              <div className="relative z-10 flex flex-col items-center">
+                  <div className="w-full flex justify-between items-start border-b border-zinc-800 pb-2 mb-4">
+                       <div className="flex gap-2 items-center mt-1">
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${activeSlot === 1 ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}>SSD 1</span>
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded ${activeSlot === 2 ? 'bg-red-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}>SSD 2</span>
+                       </div>
+                       <div className="flex flex-col items-end">
+                            <div className={`text-sm font-bold tracking-[0.2em] ${status === 'record' ? 'text-red-500 animate-pulse-rec' : 'text-hyper-accent'}`}>{displayStatus}</div>
+                            {isConnected && fileFormat && (
+                                <div className="text-[10px] text-zinc-500 font-mono mt-1 uppercase tracking-wider">
+                                    {videoInput} <span className="text-zinc-700 mx-1">|</span> {fileFormat}
+                                </div>
+                            )}
+                       </div>
+                  </div>
+                  {/* UPDATED DISPLAY: Larger fonts, Red remaining time */}
+                  <div className="flex flex-col sm:flex-row items-baseline gap-2 sm:gap-8 mb-2 w-full justify-center">
+                      <div className="text-6xl sm:text-8xl font-mono font-bold text-hyper-accent tracking-tighter tabular-nums drop-shadow-[0_0_15px_rgba(0,122,255,0.3)]">{isConnected ? timecode : "--:--:--:--"}</div>
+                      <div className="text-4xl sm:text-6xl font-mono font-bold text-red-600 tracking-tighter tabular-nums">{isConnected ? `-${remaining}` : "--:--:--:--"}</div>
+                  </div>
+                  <div className="w-full text-center mt-4">
+                      <div className="text-zinc-500 text-xs uppercase tracking-widest mb-1">Current Clip</div>
+                      <div className="text-xl font-medium text-white truncate max-w-full px-4">{isConnected ? (clipName || "No Clip Selected") : "---"}</div>
+                  </div>
+              </div>
+          </div>
+        );
+      };
+
+      // --- COMPONENT: ConnectionBar ---
+      const ConnectionBar = ({ ipAddress, isConnected, isConnecting, simulationMode, onConnect, onDisconnect, onToggleSim }) => {
+        const [ip, setIp] = useState(ipAddress);
+        return (
+          <div className="bg-hyper-panel border-b border-zinc-800 p-4 flex flex-col lg:flex-row items-center justify-between gap-4 shadow-md z-10 shrink-0">
+            <div className="flex flex-col sm:flex-row items-center gap-3">
+              <div className="text-zinc-400 font-bold tracking-widest text-sm uppercase">HyperDeck Controller</div>
+              <button onClick={onToggleSim} className={`flex items-center gap-2 px-2 py-1 rounded text-[10px] border transition-colors ${simulationMode ? 'bg-zinc-800 text-zinc-400' : 'bg-red-900/20 text-red-400 border-red-900'}`}>
+                {simulationMode ? "SIMULATION MODE" : "REAL MODE (PROXY 8081)"}
+              </button>
+            </div>
+            <form onSubmit={(e) => { e.preventDefault(); isConnected ? onDisconnect() : onConnect(ip); }} className="flex items-center gap-2 w-full sm:w-auto">
+              <input id="ip" type="text" value={ip} onChange={(e) => setIp(e.target.value)} disabled={isConnected || isConnecting} className={`bg-zinc-900 border border-zinc-700 text-white px-3 py-1.5 rounded text-sm font-mono w-36 ${isConnected ? 'opacity-50' : ''}`} />
+              <button type="submit" disabled={isConnecting} className={`flex items-center gap-2 px-4 py-1.5 rounded text-sm font-bold transition-all min-w-[120px] justify-center ${isConnected ? 'bg-zinc-800 text-red-500' : 'bg-hyper-accent text-white'}`}>
+                {isConnecting ? 'Connecting...' : (isConnected ? <><WifiOff size={16} /> Disconnect</> : <><Wifi size={16} /> Connect</>)}
+              </button>
+            </form>
+          </div>
+        );
+      };
+
+      // --- MAIN APP ---
+      const App = () => {
+        const { state, actions } = useHyperDeck();
+        const [activeTab, setActiveTab] = useState('home');
+        const logEndRef = useRef(null);
+        
+        const currentClip = state.clips.find(c => c.id == state.currentClipId);
+        const displayClipName = currentClip ? currentClip.name : (state.currentClipId ? `Unknown Clip ID ${state.currentClipId}` : "");
+
+        useEffect(() => {
+            if(logEndRef.current && activeTab === 'terminal') {
+                logEndRef.current.scrollIntoView({ behavior: "smooth" });
+            }
+        }, [state.log, activeTab]);
+
+        const handleFormatChange = (e) => {
+            const val = e.target.value;
+            if (confirm("ATTENZIONE: La macchina si riavvierà cambiando il codec. Sei sicuro di voler procedere?")) {
+                // Manual Page 23: configuration: file format: {format}
+                actions.setConfig('file format', val);
+            }
+        };
+
+        return (
+          <div className="h-screen bg-hyper-bg flex flex-col font-sans select-none overflow-hidden">
+            <ConnectionBar 
+              ipAddress={state.ipAddress} isConnected={state.isConnected} isConnecting={state.isConnecting}
+              simulationMode={state.simulationMode} onToggleSim={actions.toggleSimulation}
+              onConnect={actions.connect} onDisconnect={actions.disconnect}
+            />
+            <main className="flex-1 overflow-hidden flex flex-col max-w-5xl mx-auto w-full p-4 gap-4">
+              <Display 
+                timecode={state.timecode} remaining={state.remaining}
+                clipName={displayClipName} status={state.status} loop={state.loop}
+                activeSlot={state.activeSlot} isConnected={state.isConnected}
+                fileFormat={state.fileFormat} videoInput={state.videoInput}
+              />
+              <div className="flex border-b border-zinc-700 mb-2 shrink-0">
+                {[
+                  { id: 'home', label: 'Home', icon: PlayCircle },
+                  { id: 'ftp', label: 'Files', icon: Folder },
+                  { id: 'config', label: 'Config', icon: Settings },
+                  { id: 'terminal', label: 'Console', icon: Terminal },
+                ].map(tab => (
+                  <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+                    className={`flex items-center gap-2 px-6 py-3 text-sm font-bold uppercase tracking-wide transition-colors border-b-2 ${
+                      activeTab === tab.id ? 'border-hyper-accent text-hyper-accent bg-zinc-900' : 'border-transparent text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50'
+                    }`}
+                  >
+                    <tab.icon size={16} /> {tab.label}
+                  </button>
+                ))}
+              </div>
+              
+              {/* CONTENT AREA - FIXED SCROLLING */}
+              <div className="flex-1 overflow-hidden relative">
+                  {activeTab === 'home' && (
+                    <div className="flex flex-col gap-6 h-full overflow-y-auto pr-2 pb-2">
+                      <Transport 
+                        status={state.status} loop={state.loop} isConnected={state.isConnected}
+                        onPlay={actions.play} onStop={actions.stop} onRecord={actions.record}
+                        onShuttle={actions.shuttle} onPreview={actions.preview}
+                        onSkipNext={actions.nextClip} onSkipPrev={actions.prevClip}
+                      />
+                      
+                      <div className="bg-hyper-panel rounded-lg border border-zinc-800 overflow-hidden flex-1 flex flex-col min-h-[300px]">
+                          <div className="bg-zinc-900 px-4 py-2 border-b border-zinc-800 flex justify-between items-center shrink-0">
+                             <div className="flex flex-col">
+                                <h3 className="text-xs font-bold text-zinc-500 uppercase">Playable Clips (Slot {state.activeSlot})</h3>
+                                <span className="text-[10px] text-zinc-600">Command: clips get</span>
+                             </div>
+                             <button onClick={actions.refreshClips} className="text-xs bg-blue-900/30 hover:bg-blue-900/50 text-blue-400 px-3 py-1 rounded font-bold border border-blue-900/50">REFRESH LIST</button>
+                          </div>
+                          <div className="overflow-y-auto flex-1">
+                                <table className="w-full text-left text-sm">
+                                <thead className="bg-zinc-950 text-zinc-500 font-medium text-xs uppercase sticky top-0">
+                                    <tr><th className="px-4 py-2 w-12 text-center">ID</th><th className="px-4 py-2">Name</th><th className="px-4 py-2 w-24 text-right">Duration</th></tr>
+                                </thead>
+                                <tbody className="divide-y divide-zinc-800">
+                                    {state.clips.map(clip => (
+                                    <tr key={clip.id} onClick={() => actions.gotoClip(clip.id)} className={`cursor-pointer hover:bg-zinc-800 transition-colors ${state.currentClipId == clip.id ? 'bg-blue-900/20 text-blue-400' : 'text-zinc-300'}`}>
+                                        <td className="px-4 py-2 text-center font-mono text-zinc-500">{clip.id}</td>
+                                        <td className="px-4 py-2 font-medium truncate max-w-[200px]">{clip.name}</td>
+                                        <td className="px-4 py-2 text-right font-mono text-zinc-400">{clip.duration}</td>
+                                    </tr>
+                                    ))}
+                                </tbody>
+                                </table>
+                                {state.clips.length === 0 && <div className="p-4 text-center text-zinc-600 italic">No clips found. Format might be empty.</div>}
+                          </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeTab === 'ftp' && (
+                    <div className="bg-hyper-panel rounded-lg border border-zinc-800 overflow-hidden flex flex-col h-full">
+                        <div className="bg-zinc-900 px-4 py-2 border-b border-zinc-800 flex justify-between items-center shrink-0">
+                          <div className="flex flex-col">
+                             <h3 className="text-xs font-bold text-zinc-500 uppercase">Files Management</h3>
+                             <span className="text-[10px] text-red-400 italic">Rename/Delete requires FTP Proxy support on Port 8081</span>
+                          </div>
+                          <button onClick={actions.refreshClips} className="flex items-center gap-1 text-xs bg-zinc-800 hover:bg-zinc-700 text-white px-3 py-1 rounded font-bold transition-colors">
+                              <RefreshCw size={12} /> REFRESH
+                          </button>
+                        </div>
+                        <div className="overflow-y-auto flex-1">
+                            <table className="w-full text-left text-sm">
+                            <thead className="bg-zinc-950 text-zinc-500 font-medium text-xs uppercase sticky top-0">
+                                <tr><th className="px-4 py-2">Name</th><th className="px-4 py-2 w-48 text-right">Actions</th></tr>
+                            </thead>
+                            <tbody className="divide-y divide-zinc-800">
+                                {state.clips.map(clip => (
+                                <tr key={clip.id} className={`hover:bg-zinc-800 transition-colors`}>
+                                    <td className="px-4 py-3 font-medium">{clip.name}</td>
+                                    <td className="px-4 py-3 text-right flex justify-end gap-2">
+                                        <button onClick={() => actions.gotoClip(clip.id)} className="text-xs bg-zinc-700 hover:bg-white hover:text-black px-2 py-1 rounded">LOAD</button>
+                                        <button onClick={() => {
+                                            const newName = prompt("Rename file:", clip.name);
+                                            if(newName && newName !== clip.name) actions.renameFile(clip.name, newName);
+                                        }} className="text-xs bg-zinc-800 hover:bg-blue-600 text-zinc-400 hover:text-white p-1 rounded" title="Rename (Requires FTP Proxy)"><Edit size={16} /></button>
+                                        <button onClick={() => {
+                                            if(confirm(`Delete ${clip.name}?`)) actions.deleteFile(clip.name);
+                                        }} className="text-xs bg-zinc-800 hover:bg-red-600 text-zinc-400 hover:text-white p-1 rounded" title="Delete (Requires FTP Proxy)"><Trash2 size={16} /></button>
+                                    </td>
+                                </tr>
+                                ))}
+                            </tbody>
+                            </table>
+                        </div>
+                    </div>
+                  )}
+
+                  {activeTab === 'config' && (
+                    <div className="flex flex-col gap-6 h-full overflow-y-auto">
+                      <div className="bg-hyper-panel p-6 rounded-lg border border-zinc-800">
+                        <h2 className="text-lg font-bold text-white mb-6 flex items-center gap-2"><Settings size={20} /> Configuration</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                          <div>
+                            <label className="block text-xs font-bold text-zinc-500 uppercase mb-2">Video Input</label>
+                            <select disabled={!state.isConnected} value={state.videoInput} onChange={(e) => actions.setConfig('video input', e.target.value)} className="w-full bg-zinc-900 border border-zinc-700 text-white px-4 py-2 rounded">
+                              {INPUT_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-bold text-zinc-500 uppercase mb-2">File Format</label>
+                            <select disabled={!state.isConnected} value={state.fileFormat} onChange={handleFormatChange} className="w-full bg-zinc-900 border border-zinc-700 text-white px-4 py-2 rounded">
+                              {FORMAT_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                        <div className="border-t border-zinc-800 pt-6">
+                          <h3 className="text-xs font-bold text-zinc-500 uppercase mb-4">Active Slot</h3>
+                          <div className="flex gap-4">
+                            {[1, 2, 3].map(slot => (
+                               <button key={slot} disabled={!state.isConnected} onClick={() => actions.selectSlot(slot)} className={`flex-1 py-4 rounded flex flex-col items-center gap-2 border transition-all ${state.activeSlot === slot ? 'bg-red-900/20 border-red-600 text-red-500' : 'bg-zinc-900 border-zinc-800 text-zinc-500'}`}>
+                                  <HardDrive size={24} /><span className="font-bold">SLOT {slot}</span>
+                               </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeTab === 'terminal' && (
+                     <div className="bg-black rounded-lg border border-zinc-800 h-full flex flex-col font-mono text-sm p-4 shadow-inner">
+                        <div className="flex justify-between items-center mb-2 border-b border-zinc-900 pb-2 shrink-0">
+                           <span className="text-xs text-zinc-500 uppercase font-bold">System Console</span>
+                           <div className="flex items-center gap-2 text-[10px] text-zinc-600 bg-zinc-900 px-2 py-1 rounded">
+                               <Filter size={10} /> Auto-Filtering Active
+                           </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto mb-4 space-y-1 min-h-0">
+                           {state.log.map((line, i) => <div key={i} className="text-zinc-400 break-words text-xs whitespace-pre-wrap font-mono">{line}</div>)}
+                           <div ref={logEndRef} />
+                        </div>
+                        <div className="flex gap-2 shrink-0">
+                           <input type="text" placeholder="Enter command..." className="flex-1 bg-zinc-900 border border-zinc-700 text-white px-3 py-2 rounded" onKeyDown={(e) => { if (e.key === 'Enter' && state.isConnected && e.target.value) { actions.setConfig('raw', e.target.value); e.target.value = ''; }}} />
+                        </div>
+                     </div>
+                  )}
+              </div>
+            </main>
+          </div>
+        );
+      };
+
+      const rootElement = document.getElementById('root');
+      const root = createRoot(rootElement);
+      root.render(<App />);
+    </script>
+  </body>
+</html>
